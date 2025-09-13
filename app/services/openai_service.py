@@ -7,19 +7,27 @@ from app.models.schemas import EmbeddingResponse, PatientRecord
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Initialize OpenAI client
-openai.api_key = settings.openai_api_key
-
 
 class OpenAIService:
     """Service for handling OpenAI API interactions."""
     
     def __init__(self):
-        self.client = openai.OpenAI(api_key=settings.openai_api_key)
-        self.model = settings.openai_model
-        self.embedding_model = settings.openai_embedding_model
-        self.max_tokens = settings.max_tokens
-        self.temperature = settings.temperature
+        try:
+            # Initialize OpenAI client with just the API key
+            self.client = openai.OpenAI(api_key=settings.openai_api_key)
+            
+            self.model = settings.openai_model
+            self.embedding_model = settings.openai_embedding_model
+            self.max_tokens = settings.max_tokens
+            self.temperature = settings.temperature
+            
+            logger.info(f"OpenAI service initialized with model: {self.model}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenAI service: {str(e)}")
+            # Don't raise exception, allow service to start
+            self.client = None
+            logger.warning("OpenAI service will be unavailable")
     
     async def generate_chat_response(
         self, 
@@ -37,6 +45,9 @@ class OpenAIService:
             Generated AI response
         """
         try:
+            if self.client is None:
+                raise Exception("OpenAI client not initialized")
+                
             # Build context-aware prompt
             system_prompt = self._build_system_prompt(patient_context)
             
@@ -76,6 +87,9 @@ class OpenAIService:
             EmbeddingResponse with embedding vector
         """
         try:
+            if self.client is None:
+                raise Exception("OpenAI client not initialized")
+                
             logger.info(f"Generating embedding for text length: {len(text)}")
             
             response = self.client.embeddings.create(
@@ -143,6 +157,9 @@ Important guidelines:
             List of embedding vectors
         """
         try:
+            if self.client is None:
+                raise Exception("OpenAI client not initialized")
+                
             logger.info(f"Generating embeddings for {len(texts)} texts")
             
             # OpenAI has a limit of 2048 inputs per request

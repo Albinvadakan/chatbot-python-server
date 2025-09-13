@@ -14,7 +14,7 @@ class PineconeService:
     """Service for handling Pinecone vector database operations."""
     
     def __init__(self):
-        # Initialize Pinecone with the new API
+        # Initialize Pinecone with the new API (version 5.0+)
         self.pc = Pinecone(api_key=settings.pinecone_api_key)
         self.index_name = settings.pinecone_index_name
         self.dimension = settings.vector_dimension
@@ -45,7 +45,7 @@ class PineconeService:
                     
                     # Wait for index to be ready (with timeout)
                     import time
-                    max_wait_time = 120  # 2 minutes timeout
+                    max_wait_time = 60  # 1 minute timeout for startup
                     wait_interval = 5
                     elapsed_time = 0
                     
@@ -77,7 +77,8 @@ class PineconeService:
             
         except Exception as e:
             logger.error(f"Error initializing Pinecone index: {str(e)}")
-            raise Exception(f"Failed to initialize Pinecone: {str(e)}")
+            # Don't raise exception, allow service to start without Pinecone
+            logger.warning("Pinecone service will be unavailable")
     
     @property
     def index(self):
