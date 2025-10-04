@@ -200,6 +200,17 @@ class PDFServiceError(ServiceError):
         super().__init__(message, "pdf", details)
 
 
+class PDFAuthorizationError(PDFServiceError):
+    """Exception for PDF authorization validation errors."""
+    
+    def __init__(self, message: str, filename: str, details: dict = None):
+        self.filename = filename
+        auth_details = {"filename": filename}
+        if details:
+            auth_details.update(details)
+        super().__init__(message, auth_details)
+
+
 def log_request_info(request: Request, response_time: float = None):
     """
     Log request information.
@@ -249,3 +260,75 @@ def log_service_call(service: str, operation: str, duration: float = None, succe
     message = f"Service operation {'completed' if success else 'failed'}: {operation}"
     
     logger.log(level, message, extra=log_data)
+
+
+def is_patient_specific_query(query: str) -> bool:
+    """
+    Classify whether a query is patient-specific (requires filtering) or general.
+    
+    Patient-specific queries should only return data for the specific patient:
+    - Test reports, lab results, medical records
+    - Personal medical history, prescriptions, treatments
+    - Sensitive personal health information
+    
+    General queries can return unfiltered information:
+    - Hospital departments, doctor lists, facility information
+    - General medical information, symptoms, disease information
+    - Hospital policies, visiting hours, contact information
+    
+    Args:
+        query: User query string
+        
+    Returns:
+        True if query is patient-specific and requires filtering
+    """
+    query_lower = query.lower()
+    
+    # Patient-specific keywords that require filtering
+    patient_specific_keywords = [
+        # Test reports and lab results
+        "test result", "lab result", "blood test", "urine test", "x-ray", "mri", "ct scan",
+        "pathology", "biopsy", "ultrasound", "ecg", "ekg", "colonoscopy", "endoscopy",
+        
+        # Medical records and history
+        "my report", "my test", "my result", "my record", "my history", "my prescription",
+        "my medication", "my treatment", "my diagnosis", "my condition", "my health record",
+        
+        # Personal medical information
+        "patient id", "patient record", "medical history", "prescription history",
+        "treatment history", "diagnosis history", "allergy information", "medication list",
+        
+        # Sensitive data patterns
+        "confidential", "private", "personal health", "medical record", "health information",
+        "patient data", "clinical data", "test report", "lab report", "medical report"
+    ]
+    
+    # General information keywords (these indicate non-patient-specific queries)
+    general_keywords = [
+        # Hospital information
+        "hospital department", "doctor list", "physician list", "staff directory",
+        "facility", "location", "address", "phone number", "contact", "visiting hours",
+        "list all doctors", "doctors in", "all doctors", "hospital services",
+        
+        # General medical knowledge
+        "symptoms of", "what is", "how to", "general information", "medical information",
+        "disease information", "condition information", "treatment options", "prevention",
+        
+        # Hospital services and general queries
+        "emergency", "appointment", "booking", "schedule", "services offered", "what services",
+        "insurance", "billing", "payment", "policies", "procedures"
+    ]
+    
+    # Check for patient-specific indicators
+    for keyword in patient_specific_keywords:
+        if keyword in query_lower:
+            return True
+    
+    # Check for general query indicators
+    for keyword in general_keywords:
+        if keyword in query_lower:
+            return False
+    
+    # Default behavior: if uncertain and patient info is provided, treat as patient-specific
+    # This ensures better privacy protection by defaulting to filtered responses
+    return True

@@ -60,20 +60,75 @@ class PDFService:
             logger.error(f"Error extracting text from PDF {filename}: {str(e)}")
             raise Exception(f"Failed to extract text from PDF: {str(e)}")
     
+    def _extract_patient_info(self, text: str) -> Dict[str, Optional[str]]:
+        """
+        Extract patient information from medical document text.
+        
+        Args:
+            text: Extracted text from PDF
+            
+        Returns:
+            Dictionary with patient_id and patient_name if found
+        """
+        import re
+        
+        patient_info = {"patient_id": None, "patient_name": None}
+        
+        # Clean text for better matching
+        text_lines = text.replace('\n', ' ').strip()
+        
+        # Pattern for Patient ID (various formats)
+        patient_id_patterns = [
+            r'Patient\s+ID[:\s]*([a-fA-F0-9]{24,})',  # MongoDB ObjectId format
+            r'Patient\s+ID[:\s]*([a-fA-F0-9-]{20,})',  # Hex with dashes
+            r'Patient\s+ID[:\s]*(\d+)',  # Numeric ID
+        ]
+        
+        # Pattern for Patient Name
+        patient_name_patterns = [
+            r'Patient\s+Name[:\s]*([A-Za-z\s]+?)(?:\s+Age|\s+Gender|\s+Date|\s+ID|$)',
+            r'Name[:\s]*([A-Za-z\s]+?)(?:\s+Age|\s+Gender|\s+Date|\s+ID|$)',
+        ]
+        
+        # Extract Patient ID
+        for pattern in patient_id_patterns:
+            match = re.search(pattern, text_lines, re.IGNORECASE)
+            if match:
+                patient_info["patient_id"] = match.group(1).strip()
+                logger.info(f"Extracted patient ID: {patient_info['patient_id']}")
+                break
+        
+        # Extract Patient Name
+        for pattern in patient_name_patterns:
+            match = re.search(pattern, text_lines, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                # Clean up the name (remove extra spaces, numbers)
+                name = re.sub(r'\s+', ' ', name)  # Multiple spaces to single
+                name = re.sub(r'\d+', '', name).strip()  # Remove numbers
+                if len(name) > 1 and not re.match(r'^[^a-zA-Z]*$', name):  # Has letters
+                    patient_info["patient_name"] = name
+                    logger.info(f"Extracted patient name: {patient_info['patient_name']}")
+                    break
+        
+        return patient_info
+
     async def process_and_store_pdf(
         self, 
         pdf_content: bytes, 
         filename: str,
         patient_id: Optional[str] = None,
+        content_type: str = "patient_private",
         additional_metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Process PDF, extract text, create embeddings, and store in vector database.
+        Process PDF, extract text, create embeddings, and store in vector database with access controls.
         
         Args:
             pdf_content: PDF file content as bytes
             filename: Original filename of the PDF
-            patient_id: Optional patient identifier
+            patient_id: Optional patient identifier (required for patient_private content)
+            content_type: Content classification - 'hospital_public' or 'patient_private'
             additional_metadata: Optional additional metadata
             
         Returns:
@@ -87,6 +142,22 @@ class PDFService:
             
             if not extracted_text.strip():
                 raise Exception("No text could be extracted from the PDF")
+            
+            # Handle patient information based on content type
+            if content_type == "hospital_public":
+                # Hospital public content - no patient-specific information
+                final_patient_id = None
+                final_patient_name = None
+                logger.info(f"Hospital public content - accessible to all patients")
+            else:
+                # Patient private content - extract patient information
+                extracted_patient_info = self._extract_patient_info(extracted_text)
+                
+                # Use extracted patient ID if not provided manually
+                final_patient_id = patient_id or extracted_patient_info.get("patient_id")
+                final_patient_name = extracted_patient_info.get("patient_name")
+                
+                logger.info(f"Patient private content - ID: {final_patient_id}, Name: {final_patient_name}")
             
             # Create text chunks
             text_chunks = self._create_text_chunks(extracted_text, filename)
@@ -102,11 +173,20 @@ class PDFService:
                     "source_file": filename,
                     "chunk_index": chunk.chunk_index,
                     "upload_timestamp": datetime.utcnow().isoformat(),
-                    "content_type": "pdf_extract"
+                    "content_type": "pdf_extract",
+                    "document_content_type": content_type  # hospital_public or patient_private
                 }
                 
-                if patient_id:
-                    metadata["patient_id"] = patient_id
+                # Add patient information only for private content
+                if content_type == "patient_private":
+                    if final_patient_id:
+                        metadata["patient_id"] = final_patient_id
+                    if final_patient_name:
+                        metadata["patient_name"] = final_patient_name
+                elif content_type == "hospital_public":
+                    # Mark as public hospital content
+                    metadata["access_level"] = "public"
+                    metadata["uploaded_by"] = "hospital_admin"
                 
                 if additional_metadata:
                     metadata.update(additional_metadata)
@@ -127,7 +207,10 @@ class PDFService:
                 "extracted_text_length": len(extracted_text),
                 "chunks_created": len(text_chunks),
                 "records_stored": len(record_ids),
-                "record_ids": record_ids
+                "record_ids": record_ids,
+                "content_type": content_type,
+                "extracted_patient_id": final_patient_id,
+                "extracted_patient_name": final_patient_name
             }
             
             logger.info(f"Successfully processed PDF {filename}: {len(text_chunks)} chunks created")
@@ -238,6 +321,105 @@ class PDFService:
         except Exception as e:
             logger.warning(f"PDF validation failed: {str(e)}")
             return False
+    
+    async def validate_knh_authorization(self, pdf_content: bytes, filename: str) -> Dict[str, Any]:
+        """
+        Validate if the PDF is authorized from KNH hospital by checking for hospital identifiers.
+        
+        Args:
+            pdf_content: PDF file content as bytes
+            filename: Original filename of the PDF
+            
+        Returns:
+            Dictionary with validation results containing 'authorized' boolean and 'reason' string
+        """
+        try:
+            logger.info(f"Validating KNH authorization for: {filename}")
+            
+            # Extract text from PDF for validation
+            extracted_text = await self.extract_text_from_pdf(pdf_content, filename)
+            
+            if not extracted_text.strip():
+                return {
+                    "authorized": False,
+                    "reason": "Cannot validate authorization - no text could be extracted from PDF"
+                }
+            
+            # Convert to lowercase for case-insensitive matching
+            text_lower = extracted_text.lower()
+            
+            # Define KNH hospital validation patterns
+            knh_patterns = [
+                "knh",
+                "hospital signature",
+                "authorized by knh",
+                "knh department",
+                "official knh document",
+                "knh medical report",
+                "knh stamp",
+                "hospital seal"
+            ]
+            
+            # Additional patterns for common hospital document indicators
+            hospital_patterns = [
+                "hospital logo",
+                "medical department",
+                "doctor signature",
+                "consultant signature", 
+                "medical officer",
+                "hospital stamp",
+                "official hospital document",
+                "department of",
+                "medical report",
+                "clinical report"
+            ]
+            
+            found_patterns = []
+            
+            # Check for KNH specific patterns (high priority)
+            for pattern in knh_patterns:
+                if pattern in text_lower:
+                    found_patterns.append(pattern)
+            
+            # If KNH patterns found, document is authorized
+            if found_patterns:
+                logger.info(f"KNH authorization validated for {filename}. Found patterns: {found_patterns}")
+                return {
+                    "authorized": True,
+                    "reason": f"Authorized KNH document. Found: {', '.join(found_patterns)}",
+                    "found_patterns": found_patterns
+                }
+            
+            # Check for general hospital patterns (lower priority)
+            hospital_found = []
+            for pattern in hospital_patterns:
+                if pattern in text_lower:
+                    hospital_found.append(pattern)
+            
+            # If hospital patterns found but no KNH specific, check if it might be KNH
+            if hospital_found:
+                # Additional check for any form of "kenyatta" or hospital identifiers
+                if any(keyword in text_lower for keyword in ["kenyatta", "national hospital", "hospital"]):
+                    logger.info(f"Potential KNH document validation for {filename}. Found patterns: {hospital_found}")
+                    return {
+                        "authorized": True,
+                        "reason": f"Authorized hospital document. Found: {', '.join(hospital_found)}",
+                        "found_patterns": hospital_found
+                    }
+            
+            # No authorization patterns found
+            logger.warning(f"KNH authorization failed for {filename}. No valid hospital identifiers found.")
+            return {
+                "authorized": False,
+                "reason": "Cannot upload - document does not contain KNH hospital identifiers, signatures, or authorized labels"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error during KNH authorization validation for {filename}: {str(e)}")
+            return {
+                "authorized": False,
+                "reason": f"Authorization validation failed due to processing error: {str(e)}"
+            }
     
     async def get_pdf_info(self, pdf_content: bytes) -> Dict[str, Any]:
         """

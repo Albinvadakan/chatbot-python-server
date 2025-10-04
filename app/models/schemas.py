@@ -6,6 +6,14 @@ from datetime import datetime
 class ChatRequest(BaseModel):
     """Request model for chat API."""
     query: str = Field(..., description="User query for the AI chatbot", min_length=1, max_length=2000)
+    patientId: Optional[str] = Field(default=None, description="Patient identifier for filtering patient-specific data")
+    patientName: Optional[str] = Field(default=None, description="Patient name for filtering patient-specific data")
+
+
+class ContentType:
+    """Content type constants for document classification."""
+    HOSPITAL_PUBLIC = "hospital_public"  # Hospital admin uploads - accessible to all patients
+    PATIENT_PRIVATE = "patient_private"  # Patient uploads - only accessible to that patient
 
 
 class ChatResponse(BaseModel):

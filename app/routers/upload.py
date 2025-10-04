@@ -5,7 +5,7 @@ import time
 from app.models.schemas import PDFUploadResponse
 from app.services.pdf_service import get_pdf_service, PDFService
 from app.config import get_settings
-from app.utils import log_service_call, PDFServiceError
+from app.utils import log_service_call, PDFServiceError, PDFAuthorizationError
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -16,20 +16,22 @@ settings = get_settings()
 async def upload_pdf(
     file: UploadFile = File(...),
     patient_id: Optional[str] = Form(None),
+    content_type: str = Form("patient_private", description="Content type: 'hospital_public' for admin uploads, 'patient_private' for patient uploads"),
     pdf_service: PDFService = Depends(get_pdf_service)
 ) -> PDFUploadResponse:
     """
-    Upload and process a PDF file with optimized performance.
+    Upload and process a PDF file with content type classification.
     
     This endpoint:
     1. Validates the uploaded file
     2. Extracts text from the PDF
     3. Creates text chunks and embeddings
-    4. Stores the data in the vector database
+    4. Stores the data in the vector database with appropriate access controls
     
     Args:
         file: PDF file to upload (multipart/form-data)
-        patient_id: Optional patient identifier
+        patient_id: Optional patient identifier (required for patient_private content)
+        content_type: Content classification - 'hospital_public' (admin) or 'patient_private' (patient)
         pdf_service: PDF service dependency
         
     Returns:
@@ -38,7 +40,22 @@ async def upload_pdf(
     start_time = time.time()
     
     try:
-        logger.info(f"Processing PDF upload: {file.filename}")
+        logger.info(f"Processing PDF upload: {file.filename}, Content type: {content_type}")
+        
+        # Validate content type
+        valid_content_types = ["hospital_public", "patient_private"]
+        if content_type not in valid_content_types:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid content_type. Must be one of: {valid_content_types}"
+            )
+        
+        # For patient private content, patient_id is required
+        if content_type == "patient_private" and not patient_id:
+            raise HTTPException(
+                status_code=400,
+                detail="patient_id is required for patient_private content"
+            )
         
         # Validate file type
         if not file.filename.lower().endswith('.pdf'):
@@ -90,6 +107,35 @@ async def upload_pdf(
                 detail="Failed to validate PDF file"
             )
         
+        # Validate KNH hospital authorization
+        try:
+            authorization_start = time.time()
+            logger.info(f"Validating KNH authorization for: {file.filename}")
+            
+            auth_result = await pdf_service.validate_knh_authorization(file_content, file.filename)
+            authorization_duration = time.time() - authorization_start
+            
+            if not auth_result["authorized"]:
+                log_service_call("pdf", "validate_knh_authorization", authorization_duration, False)
+                logger.warning(f"KNH authorization failed for {file.filename}: {auth_result['reason']}")
+                
+                return PDFUploadResponse(
+                    success=False,
+                    message=auth_result["reason"],
+                    filename=file.filename
+                )
+            
+            log_service_call("pdf", "validate_knh_authorization", authorization_duration, True)
+            logger.info(f"KNH authorization validated for {file.filename} in {authorization_duration:.2f}s: {auth_result['reason']}")
+            
+        except Exception as e:
+            log_service_call("pdf", "validate_knh_authorization", None, False)
+            logger.error(f"KNH authorization validation error for {file.filename}: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to validate hospital authorization"
+            )
+        
         # Process the PDF with progress tracking
         try:
             processing_start = time.time()
@@ -100,7 +146,8 @@ async def upload_pdf(
                 "original_filename": file.filename,
                 "file_size": file_size,
                 "content_type": file.content_type,
-                "upload_method": "api"
+                "upload_method": "api",
+                "document_content_type": content_type  # hospital_public or patient_private
             }
             
             # Process with timeout handling (using asyncio.wait_for for timeout)
@@ -111,6 +158,7 @@ async def upload_pdf(
                     pdf_content=file_content,
                     filename=file.filename,
                     patient_id=patient_id,
+                    content_type=content_type,
                     additional_metadata=additional_metadata
                 ),
                 timeout=300.0  # 5 minute timeout
@@ -141,6 +189,13 @@ async def upload_pdf(
             logger.error(f"PDF processing failed for {file.filename}: {str(e)}")
             raise PDFServiceError(f"Failed to process PDF: {str(e)}")
     
+    except PDFAuthorizationError as e:
+        logger.error(f"PDF authorization error: {str(e)}")
+        return PDFUploadResponse(
+            success=False,
+            message=f"Authorization failed: {str(e)}",
+            filename=file.filename
+        )
     except PDFServiceError as e:
         logger.error(f"PDF service error: {str(e)}")
         return PDFUploadResponse(

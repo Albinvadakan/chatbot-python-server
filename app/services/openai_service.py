@@ -32,7 +32,9 @@ class OpenAIService:
     async def generate_chat_response(
         self, 
         query: str, 
-        patient_context: Optional[List[PatientRecord]] = None
+        patient_context: Optional[List[PatientRecord]] = None,
+        is_patient_specific: bool = False,
+        patient_name: Optional[str] = None
     ) -> str:
         """
         Generate AI response using OpenAI GPT model.
@@ -40,6 +42,8 @@ class OpenAIService:
         Args:
             query: User query/question
             patient_context: Optional list of relevant patient records
+            is_patient_specific: Whether this is a patient-specific query requiring filtered data
+            patient_name: Name of the patient for personalized responses
             
         Returns:
             Generated AI response
@@ -49,7 +53,7 @@ class OpenAIService:
                 raise Exception("OpenAI client not initialized")
                 
             # Build context-aware prompt
-            system_prompt = self._build_system_prompt(patient_context)
+            system_prompt = self._build_system_prompt(patient_context, is_patient_specific, patient_name)
             
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -112,12 +116,19 @@ class OpenAIService:
             logger.error(f"Error generating embedding: {str(e)}")
             raise Exception(f"Failed to generate embedding: {str(e)}")
     
-    def _build_system_prompt(self, patient_context: Optional[List[PatientRecord]] = None) -> str:
+    def _build_system_prompt(
+        self, 
+        patient_context: Optional[List[PatientRecord]] = None, 
+        is_patient_specific: bool = False,
+        patient_name: Optional[str] = None
+    ) -> str:
         """
-        Build system prompt with optional patient context.
+        Build system prompt with optional patient context and privacy guidelines.
         
         Args:
             patient_context: Optional list of patient records for context
+            is_patient_specific: Whether this is a patient-specific query
+            patient_name: Name of the patient for personalized responses
             
         Returns:
             System prompt string
@@ -127,12 +138,36 @@ class OpenAIService:
 Important guidelines:
 - Always prioritize patient safety and privacy
 - Provide helpful information but remind users to consult healthcare professionals for medical decisions
-- If patient records are provided, use them to give contextual responses
 - Be clear about the limitations of AI-generated medical advice
 - Maintain a professional and empathetic tone"""
+
+        if is_patient_specific:
+            # Add privacy protection guidelines for patient-specific queries
+            base_prompt += """
+
+CRITICAL PRIVACY REQUIREMENTS:
+- This is a PATIENT-SPECIFIC query requiring strict privacy protection
+- ONLY use information that belongs to the specified patient
+- DO NOT include or reference any other patient's data
+- If no relevant patient records are found, clearly state that no records are available
+- Focus responses on the specific patient's data only"""
+            
+            if patient_name:
+                base_prompt += f"""
+- The patient's name is: {patient_name}
+- Personalize responses appropriately while maintaining professionalism"""
+        else:
+            # For general queries, allow broader information
+            base_prompt += """
+
+GENERAL INFORMATION MODE:
+- This is a general medical/hospital information query
+- You can provide broad, non-patient-specific information
+- Include general medical knowledge, hospital services, department information, etc.
+- No patient privacy restrictions apply for this type of query"""
         
         if patient_context and len(patient_context) > 0:
-            context_section = "\n\nRelevant Patient Records:\n"
+            context_section = "\n\nRelevant Records:\n"
             for i, record in enumerate(patient_context, 1):
                 context_section += f"\nRecord {i}:\n"
                 context_section += f"Content: {record.content[:500]}...\n"
@@ -142,7 +177,13 @@ Important guidelines:
                     context_section += f"Relevance Score: {record.score:.3f}\n"
             
             base_prompt += context_section
-            base_prompt += "\n\nUse the above patient records to provide contextual and relevant responses."
+            
+            if is_patient_specific:
+                base_prompt += f"\n\nUse ONLY the above patient-specific records to provide responses. Do not include information from other patients."
+            else:
+                base_prompt += f"\n\nUse the above records along with general medical knowledge to provide comprehensive responses."
+        elif is_patient_specific:
+            base_prompt += "\n\nNo patient-specific records found. Inform the user that no records are available for their query."
         
         return base_prompt
     

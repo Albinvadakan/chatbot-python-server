@@ -5,7 +5,7 @@ import time
 from app.models.schemas import ChatRequest, ChatResponse, PatientRecord
 from app.services.openai_service import get_openai_service, OpenAIService
 from app.services.pinecone_service import get_pinecone_service, PineconeService
-from app.utils import log_service_call, OpenAIServiceError, PineconeServiceError
+from app.utils import log_service_call, OpenAIServiceError, PineconeServiceError, is_patient_specific_query
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -39,7 +39,19 @@ async def chat_ai_response(
     try:
         logger.info(f"Processing chat request: {request.query[:100]}...")
         
-        # Step 1: Generate embedding for the query
+        # Step 1: Classify query type and determine filtering requirements
+        is_patient_query = is_patient_specific_query(request.query)
+        patient_id_for_filtering = None
+        
+        if is_patient_query and request.patientId:
+            patient_id_for_filtering = request.patientId
+            logger.info(f"Patient-specific query detected for patient: {request.patientId}")
+        elif is_patient_query:
+            logger.warning("Patient-specific query detected but no patient ID provided")
+        else:
+            logger.info("General query detected - no patient filtering required")
+        
+        # Step 2: Generate embedding for the query
         try:
             embedding_start = time.time()
             embedding_response = await openai_service.generate_embedding(request.query)
@@ -51,32 +63,63 @@ async def chat_ai_response(
             log_service_call("openai", "generate_embedding", None, False)
             raise OpenAIServiceError(f"Failed to generate query embedding: {str(e)}")
         
-        # Step 2: Search for relevant patient records
+        # Step 3: Search for relevant records with mixed content filtering
         patient_context = []
         try:
             search_start = time.time()
-            search_result = await pinecone_service.search_patient_history(
-                query=request.query,
-                query_embedding=embedding_response.embedding
-            )
-            search_duration = time.time() - search_start
             
+            if is_patient_query and patient_id_for_filtering:
+                # Patient-specific query: include patient's private content + hospital public content
+                search_result = await pinecone_service.search_patient_history(
+                    query=request.query,
+                    query_embedding=embedding_response.embedding,
+                    patient_id=patient_id_for_filtering,
+                    include_public_content=True
+                )
+                logger.info(f"Patient-specific search for {patient_id_for_filtering} (includes public hospital content)")
+            elif is_patient_query:
+                # Patient-specific query without patient ID: only hospital public content
+                search_result = await pinecone_service.search_patient_history(
+                    query=request.query,
+                    query_embedding=embedding_response.embedding,
+                    patient_id=None,
+                    include_public_content=True
+                )
+                logger.info(f"Patient query without ID: only public hospital content")
+            else:
+                # General query: hospital public content + patient private (if patient ID provided)
+                search_result = await pinecone_service.search_patient_history(
+                    query=request.query,
+                    query_embedding=embedding_response.embedding,
+                    patient_id=patient_id_for_filtering,
+                    include_public_content=True
+                )
+                logger.info(f"General query: public content + patient content for {patient_id_for_filtering or 'no patient'}")
+            
+            search_duration = time.time() - search_start
             patient_context = search_result.records
             log_service_call("pinecone", "search_patient_history", search_duration, True)
             
-            logger.info(f"Found {len(patient_context)} relevant patient records")
+            logger.info(f"Found {len(patient_context)} total records")
+            
+            # Log content type breakdown for debugging
+            public_count = sum(1 for r in patient_context if r.metadata.get("document_content_type") == "hospital_public")
+            private_count = len(patient_context) - public_count
+            logger.info(f"Content breakdown: {public_count} public, {private_count} private records")
             
         except Exception as e:
             log_service_call("pinecone", "search_patient_history", None, False)
             logger.warning(f"Failed to search patient history: {str(e)}")
             # Continue without patient context rather than failing completely
         
-        # Step 3: Generate AI response with context
+        # Step 4: Generate AI response with appropriate context and privacy controls
         try:
             response_start = time.time()
             ai_response = await openai_service.generate_chat_response(
                 query=request.query,
-                patient_context=patient_context
+                patient_context=patient_context,
+                is_patient_specific=is_patient_query,
+                patient_name=request.patientName
             )
             response_duration = time.time() - response_start
             
@@ -86,17 +129,53 @@ async def chat_ai_response(
             log_service_call("openai", "generate_chat_response", None, False)
             raise OpenAIServiceError(f"Failed to generate AI response: {str(e)}")
         
-        # Prepare patient context for response (limit to preserve response size)
+        # Prepare context for response (with content type classification)
         context_for_response = []
         for record in patient_context[:3]:  # Limit to top 3 records
+            record_metadata = record.metadata or {}
+            content_type = record_metadata.get("document_content_type", "unknown")
+            
+            # Determine what to show based on content type
+            if content_type == "hospital_public":
+                # Hospital public content - show as public
+                metadata_for_response = {
+                    "content_type": "hospital_public",
+                    "source": record_metadata.get("source_file", "unknown"),
+                    "access_level": "public",
+                    "query_classification": "patient_specific" if is_patient_query else "general"
+                }
+            elif content_type == "patient_private":
+                # Patient private content - only show if it's the correct patient
+                if patient_id_for_filtering and record.patient_id == patient_id_for_filtering:
+                    metadata_for_response = {
+                        "content_type": "patient_private",
+                        "patient_id": record.patient_id,
+                        "source": record_metadata.get("source_file", "unknown"),
+                        "access_level": "private",
+                        "query_classification": "patient_specific" if is_patient_query else "general"
+                    }
+                else:
+                    # Skip this record - wrong patient or no patient ID
+                    logger.warning(f"Filtering out private record {record.record_id} - patient mismatch")
+                    continue
+            else:
+                # Unknown content type - treat as private and filter carefully
+                if patient_id_for_filtering and record.patient_id == patient_id_for_filtering:
+                    metadata_for_response = {
+                        "content_type": "unknown",
+                        "patient_id": record.patient_id,
+                        "source": record_metadata.get("source_file", "unknown"),
+                        "access_level": "private",
+                        "query_classification": "patient_specific" if is_patient_query else "general"
+                    }
+                else:
+                    continue
+            
             context_for_response.append({
                 "record_id": record.record_id,
                 "content": record.content[:200] + "..." if len(record.content) > 200 else record.content,
                 "score": record.score,
-                "metadata": {
-                    "patient_id": record.patient_id,
-                    "source": record.metadata.get("source_file", "unknown")
-                }
+                "metadata": metadata_for_response
             })
         
         total_duration = time.time() - start_time
@@ -155,13 +234,17 @@ async def chat_health_check(
         health_status["services"]["openai"] = "unhealthy"
         health_status["status"] = "degraded"
     
-    # Check vector storage service
+    # Check Pinecone service
     try:
-        await vector_service.get_index_stats()
-        health_status["services"]["vector_storage"] = "healthy"
+        # Simple index status check
+        if hasattr(pinecone_service, 'index') and pinecone_service.index:
+            health_status["services"]["pinecone"] = "healthy"
+        else:
+            health_status["services"]["pinecone"] = "unhealthy"
+            health_status["status"] = "degraded"
     except Exception as e:
-        logger.warning(f"Vector storage health check failed: {str(e)}")
-        health_status["services"]["vector_storage"] = "unhealthy"
+        logger.warning(f"Pinecone health check failed: {str(e)}")
+        health_status["services"]["pinecone"] = "unhealthy"
         health_status["status"] = "degraded"
     
     return health_status

@@ -87,26 +87,57 @@ class PineconeService:
             self._initialize_index()
         return self._index
     
-    async def search_patient_history(self, query: str, query_embedding: List[float]) -> SearchResult:
+    async def search_patient_history(
+        self, 
+        query: str, 
+        query_embedding: List[float], 
+        patient_id: Optional[str] = None,
+        include_public_content: bool = True
+    ) -> SearchResult:
         """
-        Search patient history using vector similarity.
+        Search patient history using vector similarity with content type filtering.
         
         Args:
             query: Original query string
             query_embedding: Query embedding vector
+            patient_id: Optional patient ID to filter results (for patient-specific queries)
+            include_public_content: Whether to include hospital public content in results
             
         Returns:
-            SearchResult with matching patient records
+            SearchResult with matching patient records (patient-specific + public hospital content)
         """
         try:
             logger.info(f"Searching patient history for query: {query[:100]}...")
+            if patient_id:
+                logger.info(f"Including patient-specific content for patient ID: {patient_id}")
+            if include_public_content:
+                logger.info(f"Including hospital public content")
+            
+            # Build filter for mixed content search
+            filter_dict = None
+            
+            if patient_id and include_public_content:
+                # Include both patient-specific content AND hospital public content
+                filter_dict = {
+                    "$or": [
+                        {"patient_id": {"$eq": patient_id}},  # Patient's private content
+                        {"document_content_type": {"$eq": "hospital_public"}}  # Hospital public content
+                    ]
+                }
+            elif patient_id:
+                # Only patient-specific content (no public content)
+                filter_dict = {"patient_id": {"$eq": patient_id}}
+            elif include_public_content:
+                # Only hospital public content (no patient-specific content)
+                filter_dict = {"document_content_type": {"$eq": "hospital_public"}}
             
             # Perform vector search
             search_response = self.index.query(
                 vector=query_embedding,
                 top_k=self.top_k,
                 include_metadata=True,
-                include_values=False
+                include_values=False,
+                filter=filter_dict
             )
             
             # Convert results to PatientRecord objects
